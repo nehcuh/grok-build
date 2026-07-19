@@ -3,3 +3,5 @@
 .DS_Store
 # Windows: protoc writes descriptor output to 'NUL' (null device) on first run
 NUL
+# Distribution packages (built locally, not committed)
+/dist/
