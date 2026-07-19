@@ -59,10 +59,30 @@ rustflags = [
 ]
 
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "force-unwind-tables=yes",
+    "-C", "target-feature=+crt-static",
+    # Disable debug info on Windows to avoid MSVC linker LNK1318 PDB size limit
+    # (LIMIT 12) on large binaries like xai-grok-pager. PDB files are not needed
+    # for local development builds; enable only if you need a debugger.
+    "-C", "debuginfo=0",
+    "-C", "link-arg=/DEBUG:NONE",
+    # Windows default main-thread stack is 1 MB; Linux/macOS default is 8 MB.
+    # This application has deep call chains at startup (before the tokio runtime
+    # and its worker threads start), which causes STATUS_STACK_OVERFLOW (0xC00000FD)
+    # on Windows. Set the PE header stack reserve to 64 MB to match typical
+    # Unix behaviour for large async applications.
+    "-C", "link-arg=/STACK:67108864",
+]
 
 [target.aarch64-pc-windows-msvc]
-rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"]
+rustflags = [
+    "-C", "force-unwind-tables=yes",
+    "-C", "target-feature=+crt-static",
+    "-C", "debuginfo=0",
+    "-C", "link-arg=/DEBUG:NONE",
+    "-C", "link-arg=/STACK:67108864",
+]
 
 
 # jemalloc page size for Apple Silicon (macOS aarch64 uses 16KB pages = 2^14).
