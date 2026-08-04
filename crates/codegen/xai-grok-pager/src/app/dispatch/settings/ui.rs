@@ -54,6 +54,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
     for agent in app.agents.values_mut() {
         // Walk both `Settings` and `ResetSettingsConfirm` — the
         // confirm dialog embeds settings state that must stay fresh
@@ -92,6 +93,9 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 auto_mode_gate: auto_mode_gate_from_app,
                 ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                 voice_stt_language: voice_stt_language_from_app.clone(),
+                scheduler_background_loops: agent
+                    .scheduler_background_loops
+                    .unwrap_or(scheduler_background_loops_seed),
             };
         }
     }
@@ -118,7 +122,7 @@ pub(in crate::app::dispatch) fn dispatch_open_command_palette(app: &mut AppView)
     agent.active_modal = Some(ActiveModal::CommandPalette {
         entries: crate::views::modal::default_palette_entries(
             agent.sharing_enabled,
-            agent.prompt.slash_controller.screen_mode(),
+            &agent.prompt.slash_controller,
         ),
         // Type-to-find: open in input mode (matches Ctrl+P).
         state: crate::views::picker::PickerState::input_active(),
@@ -191,6 +195,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
 
     let Some(agent) = app.agents.get_mut(&id) else {
         return effects;
@@ -238,6 +243,9 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         auto_mode_gate: auto_mode_gate_from_app,
         ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
         voice_stt_language: voice_stt_language_from_app,
+        scheduler_background_loops: agent
+            .scheduler_background_loops
+            .unwrap_or(scheduler_background_loops_seed),
     };
     let mut state = Box::new(SettingsModalState::new(
         registry,
@@ -247,9 +255,11 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     if let Some(key) = focus_key
         && state.focus_key(key)
     {
-        // Land directly on the setting's chooser page (e.g. the coding data
-        // sharing opt-in/out picker), not just the focused browse row.
-        state.try_enter_picking_enum();
+        // Try the chooser; a locked row keeps Browse (`try_enter_picking_enum`
+        // refuses when `row_lock` is set).
+        if state.try_enter_picking_enum() {
+            state.close_on_picker_exit = true;
+        }
     }
     agent.active_modal = Some(ActiveModal::Settings { state });
     effects
@@ -650,6 +660,20 @@ fn agent_auto_mode(app: &AppView) -> bool {
     false
 }
 
+/// Effective `scheduler_background_loops` for the active agent: the value the
+/// shell pinned for that session, falling back to the startup seed while the
+/// session response is still in flight (or with no agent at all). See
+/// [`agent_multiline_mode`] for the no-agent fallback rationale.
+fn agent_scheduler_background_loops(app: &AppView) -> bool {
+    if let ActiveView::Agent(id) = app.active_view
+        && let Some(agent) = app.agents.get(&id)
+        && let Some(value) = agent.scheduler_background_loops
+    {
+        return value;
+    }
+    app.scheduler_background_loops_seed
+}
+
 /// Effective `plan_mode` for the active agent
 /// (`pending.unwrap_or(active)`).
 fn agent_plan_mode(app: &AppView) -> bool {
@@ -716,6 +740,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         auto_mode_gate: app.auto_mode_gate,
         ask_user_question_timeout_enabled: app.ask_user_question_timeout_enabled,
         voice_stt_language: app.voice_config.language.clone(),
+        scheduler_background_loops: agent_scheduler_background_loops(app),
     }
 }
 

@@ -36,8 +36,9 @@ pub struct CampaignOverride {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct DoomLoopRecoverySettings {
-    /// Send the `x-grok-doom-loop-check` header and parse the reported
-    /// triggers. `Some(false)` is a kill-switch; absent ⇒ client default (off).
+    /// Send the `x-grok-doom-loop-check` header, parse the reported
+    /// triggers, and resample confident loops. `Some(false)` is a
+    /// kill-switch; absent ⇒ client default (ON).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     /// Highest `tail_repetition` threshold considered confident (clamped to
@@ -150,7 +151,7 @@ pub struct WorktreeAutoGcSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub max_age_by_kind: Option<std::collections::BTreeMap<String, WorktreeKindMaxAge>>,
-    /// Optional discovery rebuild + stale `.git/worktrees/` prune (default off).
+    /// Optional discovery rebuild + grok-scoped stale `.git/worktrees/` scrub (default off).
     #[serde(
         default,
         deserialize_with = "de_opt_bool_tolerant",
@@ -1003,6 +1004,9 @@ pub struct RemoteSettings {
     /// further override per the resolver chain.
     #[serde(default)]
     pub auto_compact_threshold_percent: Option<u8>,
+    /// Max subagent nesting depth (`grok_build_settings.subagents_max_depth`).
+    #[serde(default)]
+    pub subagents_max_depth: Option<u32>,
     /// Global system-prompt identity label. Per-model override wins; see
     /// `resolve_system_prompt_label`.
     #[serde(default)]

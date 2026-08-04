@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::io::{self, BufRead, BufReader, Seek};
 use std::path::{Path, PathBuf};
 
 use crate::extensions::notification::SessionNotification;
@@ -20,6 +20,7 @@ pub mod jsonl;
 pub(crate) mod relocation;
 pub mod search;
 pub mod search_fts;
+mod search_recovery;
 pub mod search_remote_sync;
 pub(crate) mod summary_write;
 
@@ -485,22 +486,6 @@ impl UpdatesIterator {
         let file = std::fs::File::open(path)?;
         Ok(Some(Self {
             reader: BufReader::new(file),
-            line_buffer: String::new(),
-        }))
-    }
-
-    /// Create a new iterator starting at the given byte offset.
-    /// Returns None if the file doesn't exist.
-    /// Used for delta replay: read only updates appended after a known offset.
-    pub fn open_at(path: &Path, offset: u64) -> io::Result<Option<Self>> {
-        if !path.exists() {
-            return Ok(None);
-        }
-        let file = std::fs::File::open(path)?;
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(offset))?;
-        Ok(Some(Self {
-            reader,
             line_buffer: String::new(),
         }))
     }
@@ -3001,6 +2986,42 @@ mod tests {
         assert!(result[1].contains("resp1"));
         assert!(result[2].contains("replacement"));
         assert!(result[3].contains("resp3"));
+    }
+
+    #[test]
+    fn filter_rewind_ignores_a_malformed_middle_line() {
+        let user_message_1 = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"first"}}"#,
+        );
+        let agent_message_1 = acp_envelope(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"resp1"}}"#,
+        );
+        let user_message_2 = acp_envelope(
+            r#"{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"second"}}"#,
+        );
+        let agent_message_2 = acp_envelope(
+            r#"{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"resp2"}}"#,
+        );
+        let rewind_to_1 = xai_envelope(
+            r#"{"sessionUpdate":"rewind_marker","target_prompt_index":1,"created_at":"2024-01-01"}"#,
+        );
+        let torn = "{ torn, unparseable jsonl line";
+
+        // The malformed line is kept but not counted as a prompt boundary, so
+        // the rewind still drops prompt 1.
+        let survivors = filter_rewind_lines(vec![
+            user_message_1.as_str(),
+            agent_message_1.as_str(),
+            torn,
+            user_message_2.as_str(),
+            agent_message_2.as_str(),
+            rewind_to_1.as_str(),
+        ]);
+
+        pretty_assertions::assert_eq!(
+            survivors,
+            vec![user_message_1.as_str(), agent_message_1.as_str(), torn]
+        );
     }
 
     #[test]

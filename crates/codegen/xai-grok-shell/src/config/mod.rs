@@ -224,6 +224,9 @@ impl MemoryConfig {
 pub struct SubagentsConfig {
     /// Whether subagent support is enabled.
     pub enabled: bool,
+    /// Raw `[subagents] max_depth` (i64 so out-of-range parses; clamped ≥1 at resolve).
+    #[serde(default)]
+    pub max_depth: Option<i64>,
     /// Per-subagent model ID overrides.
     /// Keys are agent names, values are model IDs that must exist in the
     /// available models registry. Parsed from `[subagents.models]` in config.toml.
@@ -383,7 +386,7 @@ impl SubagentsConfig {
     /// File-based personas are loaded from `{cwd}/.grok/personas/*.toml`.
     /// Each file defines a single `SubagentPersona`. The file stem becomes
     /// the persona name. Inline config takes precedence.
-    pub fn discover_personas(&mut self, cwd: &std::path::Path) {
+    pub(crate) fn discover_personas(&mut self, cwd: &std::path::Path) {
         let dir = cwd.join(".grok").join("personas");
         self.discover_personas_in_dir(&dir);
     }
@@ -426,9 +429,61 @@ impl SubagentsConfig {
     /// The file stem becomes the role name.
     ///
     /// Precedence: inline config roles override file-based roles with the same name.
-    pub fn discover_roles(&mut self, cwd: &std::path::Path) {
+    pub(crate) fn discover_roles(&mut self, cwd: &std::path::Path) {
         let roles_dir = cwd.join(".grok").join("roles");
         self.discover_roles_in_dir(&roles_dir);
+    }
+    pub const ENV_MAX_DEPTH: &'static str = "GROK_SUBAGENTS_MAX_DEPTH";
+    pub const DEFAULT_MAX_DEPTH: u32 = 1;
+    /// Clamp to `1..=u32::MAX`. Values below 1 (including 0 / negatives) warn
+    /// and become 1 so nesting is never accidentally disabled.
+    pub(crate) fn clamp_max_depth(raw: i64, source: &str) -> u32 {
+        if raw < i64::from(Self::DEFAULT_MAX_DEPTH) {
+            tracing::warn!(
+                source,
+                value = raw,
+                "subagents max_depth < 1; clamping to 1"
+            );
+            Self::DEFAULT_MAX_DEPTH
+        } else if raw > i64::from(u32::MAX) {
+            tracing::warn!(
+                source,
+                value = raw,
+                "subagents max_depth exceeds u32::MAX; clamping"
+            );
+            u32::MAX
+        } else {
+            raw as u32
+        }
+    }
+    /// Precedence: env > TOML > remote > [`Self::DEFAULT_MAX_DEPTH`].
+    ///
+    /// Depth 0 is the top-level session; a child is parent+1. Spawn is rejected
+    /// when `depth >= max`. So `max = 1` allows only top-level spawns; nested
+    /// spawns from a first-level subagent need `max >= 2`.
+    pub(crate) fn resolve_max_depth(
+        env: Option<&str>,
+        config: Option<i64>,
+        remote: Option<u32>,
+    ) -> u32 {
+        if let Some(raw) = env {
+            match raw.trim().parse::<i64>() {
+                Ok(v) => return Self::clamp_max_depth(v, "env"),
+                Err(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "invalid GROK_SUBAGENTS_MAX_DEPTH (expected integer); ignoring"
+                    );
+                }
+            }
+        }
+        if let Some(v) = config {
+            return Self::clamp_max_depth(v, "config");
+        }
+        if let Some(v) = remote {
+            return Self::clamp_max_depth(i64::from(v), "remote");
+        }
+        Self::DEFAULT_MAX_DEPTH
     }
     /// Resolve the final subagents config from all sources (in priority order):
     /// 1. CLI flag `--subagents` (absolute highest — always enables)
@@ -436,7 +491,7 @@ impl SubagentsConfig {
     /// 3. Config file `[subagents]` section
     /// 4. Default (enabled)
     ///
-    /// Subagents are deliberately not remotely gated — only explicit local
+    /// `enabled` is deliberately not remotely gated — only explicit local
     /// intent (CLI flag, `GROK_SUBAGENTS`, `[subagents] enabled`) changes
     /// the default.
     ///
@@ -564,7 +619,7 @@ impl ManagedMcpsConfig {
 /// Auxiliary model overrides under `[models]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
-pub struct ModelOverrideConfig {
+pub(crate) struct ModelOverrideConfig {
     pub web_search: String,
     /// `None` = current model.
     pub session_summary: Option<String>,
@@ -844,7 +899,7 @@ impl StorageMode {
     /// requires grok.com auth (it syncs to grok-code-backend). This is the
     /// single home for that gate, used at boot ([`crate::agent::init`]) and by
     /// the post-readiness self-heal (`MvpAgent::reapply_storage_mode`).
-    pub fn from_remote_gated(
+    pub(crate) fn from_remote_gated(
         remote: Option<&crate::util::config::RemoteSettings>,
         has_xai_auth: bool,
     ) -> Self {
@@ -852,10 +907,6 @@ impl StorageMode {
             Self::Writeback if !has_xai_auth => Self::Local,
             mode => mode,
         }
-    }
-    /// Returns true if this mode syncs to the backend.
-    pub fn is_writeback(&self) -> bool {
-        matches!(self, Self::Writeback)
     }
 }
 pub use xai_grok_config::ConfigLayers;
@@ -869,7 +920,7 @@ pub use xai_grok_config::{
     normalize_identity, requirements_layers, system_config_dir, user_grok_home,
 };
 /// Map of "dotted.path" to which config file the value came from.
-pub fn config_origins(
+pub(crate) fn config_origins(
     layers: &ConfigLayers,
 ) -> std::collections::HashMap<String, crate::agent::config::ConfigSource> {
     use crate::agent::config::ConfigSource;
@@ -966,7 +1017,7 @@ pub struct Sourced<T> {
 }
 /// A config field clamped by requirements.
 #[derive(Debug, Clone)]
-pub struct EnforcedField {
+pub(crate) struct EnforcedField {
     pub path: &'static str,
     pub value: String,
     pub source: RequirementSource,
@@ -978,7 +1029,7 @@ impl std::fmt::Display for EnforcedField {
 }
 /// Apply overrides from external `managed-settings.json`.
 /// Called before `apply_requirements()` so requirements.toml can override.
-pub fn apply_managed_settings_features(
+pub(crate) fn apply_managed_settings_features(
     config: &mut crate::agent::config::Config,
 ) -> Vec<EnforcedField> {
     let ms = xai_grok_workspace::permission::resolution::managed_settings();
@@ -1013,7 +1064,7 @@ fn apply_managed_settings_features_inner(
 }
 /// Clamp `AgentConfig` fields per `requirements.toml`. No-op if absent.
 /// System pins win over user pins on conflict.
-pub fn apply_requirements(config: &mut crate::agent::config::Config) -> Vec<EnforcedField> {
+pub(crate) fn apply_requirements(config: &mut crate::agent::config::Config) -> Vec<EnforcedField> {
     requirements_layers()
         .into_iter()
         .flat_map(|layer| {
@@ -1098,7 +1149,6 @@ fn apply_requirements_inner(
     }
     pin_feature!(feedback);
     pin_feature!(lsp_tools);
-    pin_feature!(tool_search);
     pin_feature!(web_fetch);
     pin_feature!(ask_user_question);
     pin_feature!(image_gen);
@@ -1426,11 +1476,6 @@ pub fn apply_sandbox(
         sandbox.install();
     }
 }
-/// Load `<cwd>/.grok/config.toml` (with this layer's `[[version_overrides]]`
-/// applied). Empty table if the file is missing.
-pub fn load_project_config(cwd: &std::path::Path) -> std::io::Result<toml::Value> {
-    load_config_file(&cwd.join(".grok").join("config.toml"))
-}
 pub use xai_grok_workspace::project_config::find_project_configs;
 /// Resolve the effective `[plugins]` config for a working directory the same
 /// way a session does at reload time: global/user config
@@ -1442,7 +1487,7 @@ pub use xai_grok_workspace::project_config::find_project_configs;
 /// eager plugin-registry fan-out so all three discover the same plugins for a
 /// given cwd. Centralizing it prevents the paths/disabled/discovered-command
 /// drift those callers would otherwise accumulate.
-pub fn resolve_effective_plugins_config(
+pub(crate) fn resolve_effective_plugins_config(
     cwd: &std::path::Path,
 ) -> crate::agent::config::PluginsConfig {
     let extract = |toml_val: &toml::Value| -> Option<crate::agent::config::PluginsConfig> {
@@ -1473,7 +1518,7 @@ pub use xai_grok_config::{deep_merge_toml, expand_env_vars_in_string, expand_env
 ///
 /// Creates the `[plugins]` section and `paths` array if they don't exist.
 /// Deduplicates: if the path is already present, this is a no-op.
-pub fn add_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn add_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
     let content = std::fs::read_to_string(&config_path).unwrap_or_default();
     let mut config: toml::Value = if content.is_empty() {
@@ -1514,7 +1559,7 @@ pub fn add_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 /// Remove a plugin path from `[plugins].paths` in `~/.grok/config.toml`.
 ///
 /// If the path is not found, this is a no-op (returns Ok).
-pub fn remove_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn remove_plugin_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = crate::util::grok_home::grok_home().join("config.toml");
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
@@ -1690,7 +1735,7 @@ pub fn dismissed_plugin_ctas_in_file(
 /// CWE-427: Only paths under `~/.grok/` are allowed to prevent
 /// arbitrary hook path injection that bypasses the project trust gate.
 /// Paths are canonicalized (resolving symlinks and `..`) before checking.
-pub fn validate_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn validate_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let candidate = std::path::Path::new(path);
     if !candidate.is_absolute() {
         return Err("Hook path must be absolute.".into());
@@ -1730,7 +1775,7 @@ pub fn validate_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>>
 ///
 /// Auto-enables all plugins in the repo so they are active after the next reload.
 /// Returns `(plugin_names, warnings)` for status messaging.
-pub fn post_install_plugin(repo_key: &str) -> (Vec<String>, Vec<String>) {
+pub(crate) fn post_install_plugin(repo_key: &str) -> (Vec<String>, Vec<String>) {
     let registry = xai_grok_agent::plugins::InstallRegistry::load();
     let Some(repo) = registry.get_repo(repo_key) else {
         return (
@@ -1816,7 +1861,7 @@ pub fn remove_enabled_plugin(plugin_id: &str) -> Result<(), Box<dyn std::error::
 ///
 /// If the path is already present (exact string match), this is a no-op.
 /// CWE-427: The path is validated to be under `~/.grok/` before writing.
-pub fn add_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn add_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     validate_hooks_path(path)?;
     add_hooks_path_to_file(
         path,
@@ -1824,7 +1869,7 @@ pub fn add_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     )
 }
 /// Add a hook path to a specific file (for tests).
-pub fn add_hooks_path_to_file(
+pub(crate) fn add_hooks_path_to_file(
     path: &str,
     paths_file: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1847,14 +1892,14 @@ pub fn add_hooks_path_to_file(
 ///
 /// If the path is not found (exact string match), this is a no-op.
 /// Matches the same exact-string behavior as `add_hooks_path`.
-pub fn remove_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn remove_hooks_path(path: &str) -> Result<(), Box<dyn std::error::Error>> {
     remove_hooks_path_from_file(
         path,
         &crate::util::grok_home::grok_home().join("hooks-paths"),
     )
 }
 /// Remove a hook path from a specific file (for tests).
-pub fn remove_hooks_path_from_file(
+pub(crate) fn remove_hooks_path_from_file(
     path: &str,
     paths_file: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {

@@ -90,17 +90,13 @@ static WORKSPACE_RPC_DURATION_SECONDS: std::sync::LazyLock<HistogramVec> =
         .unwrap()
     });
 const UNKNOWN_METHOD_LABEL: &str = "unknown";
-/// Prefix of the [`WorkspaceError::HubError`] for an unrecognized method. Shared
-/// by the dispatch default arm and the metric classifier so the "collapse to
-/// `unknown`" decision cannot drift from the error it keys on.
-const UNKNOWN_METHOD_ERR_PREFIX: &str = "unknown workspace method:";
 /// Zero-init this module's metric families. See [`crate::init_metrics`].
 pub(crate) fn init_metrics() {
     WORKSPACE_RPC_REQUESTS_TOTAL
         .with_label_values(&[UNKNOWN_METHOD_LABEL, "error"])
         .inc_by(0);
     WORKSPACE_RPC_ERRORS_TOTAL
-        .with_label_values(&[UNKNOWN_METHOD_LABEL, "hub_error"])
+        .with_label_values(&[UNKNOWN_METHOD_LABEL, "unknown_method"])
         .inc_by(0);
     let _ = WORKSPACE_RPC_DURATION_SECONDS.with_label_values(&[UNKNOWN_METHOD_LABEL]);
 }
@@ -247,8 +243,7 @@ async fn list_outstanding_background_tasks(
         })
         .collect()
 }
-/// Point-in-time snapshot of the session's outstanding background terminal
-/// tasks and live scheduled tasks.
+/// Incomplete backgrounded terminal tasks + live scheduled tasks (client tray rebuild).
 async fn tasks_snapshot(toolset: &FinalizedToolset) -> TasksSnapshotResponse {
     let (terminal, scheduler) = {
         let res = toolset.resources.lock().await;
@@ -262,7 +257,7 @@ async fn tasks_snapshot(toolset: &FinalizedToolset) -> TasksSnapshotResponse {
             .list_tasks()
             .await
             .into_iter()
-            .filter(|t| !t.completed)
+            .filter(|t| t.is_outstanding_background())
             .map(|t| {
                 let command = t
                     .display_command
@@ -756,6 +751,9 @@ impl WorkspaceRpcHandler {
             <GitCommitReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<GitCommitReq>(params, &self.workspace, None).await
             }
+            <GitSyncBaseReq as WorkspaceRpc>::METHOD => {
+                dispatch_op::<GitSyncBaseReq>(params, &self.workspace, None).await
+            }
             <GitCheckoutReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<GitCheckoutReq>(params, &self.workspace, None).await
             }
@@ -928,9 +926,7 @@ impl WorkspaceRpcHandler {
             }
             _ => {
                 tracing::warn!(method, "unknown workspace rpc method");
-                Err(WorkspaceError::HubError(format!(
-                    "{UNKNOWN_METHOD_ERR_PREFIX} {method}"
-                )))
+                Err(WorkspaceError::UnknownMethod(method.to_owned()))
             }
         }
     }
@@ -987,10 +983,7 @@ impl ToolServerHandler for WorkspaceRpcHandler {
                 bound_session.as_deref().map(|s| s.0.as_str()),
             )
             .await;
-        let is_unknown_method = matches!(
-            &result,
-            Err(WorkspaceError::HubError(msg)) if msg.starts_with(UNKNOWN_METHOD_ERR_PREFIX)
-        );
+        let is_unknown_method = matches!(&result, Err(WorkspaceError::UnknownMethod(_)));
         let method_label = if is_unknown_method {
             UNKNOWN_METHOD_LABEL
         } else {
@@ -1271,15 +1264,18 @@ mod tests {
         assert_eq!(reply, turn_hook::HookReply::default());
     }
     #[tokio::test]
-    async fn dispatch_unknown_method_returns_hub_error() {
+    async fn dispatch_unknown_method_returns_unknown_method_error() {
         let handle = make_handle();
         let handler = WorkspaceRpcHandler::new(handle);
         let result = handler
             .dispatch("workspace.nonexistent", Value::Null, None)
             .await;
-        assert!(
-            matches!(result, Err(WorkspaceError::HubError(msg)) if msg.contains("unknown workspace method"))
-        );
+        match result {
+            Err(WorkspaceError::UnknownMethod(method)) => {
+                assert_eq!(method, "workspace.nonexistent");
+            }
+            other => panic!("expected UnknownMethod, got {other:?}"),
+        }
     }
     /// A hub evict runs the two-phase drain then settles into terminal
     /// ShuttingDown (not a lingering Draining) for an evicted workspace.
@@ -1523,6 +1519,149 @@ mod tests {
             "next_fire_at must be RFC3339: {}",
             loop_task.next_fire_at
         );
+    }
+    /// FG in-flight out of snapshot; after backgrounding in; completed BG out.
+    /// Preconditions ensure a bare `!completed` filter would fail.
+    #[tokio::test]
+    async fn tasks_snapshot_excludes_foreground_and_completed_processes() {
+        use crate::handle::tests::terminal_run_request;
+        use std::time::{Duration, Instant};
+        let handle = make_handle();
+        let cfg = background_capable_cfg();
+        let session = handle
+            .create_session_with_config(
+                "snap-fg-rpc",
+                None,
+                Some(cfg.clone()),
+                CapabilityMode::All,
+                None,
+                false,
+            )
+            .expect("create background-capable session");
+        session.set_bind_tool_config_fingerprint(serde_json::to_value(&cfg).ok());
+        let out_dir = tempfile::tempdir().expect("temp dir");
+        let handler = WorkspaceRpcHandler::new(handle.clone());
+        async fn snapshot(handler: &WorkspaceRpcHandler) -> TasksSnapshotResponse {
+            let value = handler
+                .dispatch(
+                    "workspace.tasks_snapshot",
+                    serde_json::json!({"session_id": "snap-fg-rpc"}),
+                    Some("snap-fg-rpc"),
+                )
+                .await
+                .expect("tasks_snapshot rpc");
+            serde_json::from_value(value).expect("decode response")
+        }
+        let backend = session.terminal_backend().clone();
+        let fg_req = terminal_run_request("sleep 30", out_dir.path(), "snap-fg-task");
+        let fg_join = tokio::spawn(async move { backend.run(fg_req).await });
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let listed = session.terminal_backend().list_tasks().await;
+            if listed.iter().any(|t| !t.completed && !t.is_backgrounded) {
+                break;
+            }
+            assert!(
+                Instant::now() < poll_deadline,
+                "timeout waiting for incomplete FG in list_tasks: {listed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snap = snapshot(&handler).await;
+        assert!(
+            snap.background_tasks.is_empty(),
+            "in-flight FG must not appear in tasks_snapshot: {:?}",
+            snap.background_tasks
+        );
+        assert!(
+            session
+                .terminal_backend()
+                .background_foreground_command("snap-fg-task")
+                .await,
+            "expected FG process snap-fg-task to background"
+        );
+        let snap = snapshot(&handler).await;
+        assert!(
+            snap.background_tasks
+                .iter()
+                .any(|t| t.task_id == "snap-fg-task"),
+            "backgrounded former FG must appear: {:?}",
+            snap.background_tasks
+        );
+        assert_eq!(
+            snap.background_tasks.len(),
+            1,
+            "only the transitioned FG so far: {:?}",
+            snap.background_tasks
+        );
+        let bg = start_background_sleep(&session, out_dir.path(), "snap-bg-task").await;
+        let snap = snapshot(&handler).await;
+        assert_eq!(
+            snap.background_tasks.len(),
+            2,
+            "transitioned FG + incomplete BG must appear: {:?}",
+            snap.background_tasks
+        );
+        assert!(
+            snap.background_tasks
+                .iter()
+                .any(|t| t.task_id == bg.task_id),
+            "run_background task missing: {:?}",
+            snap.background_tasks
+        );
+        let short = session
+            .terminal_backend()
+            .run_background(terminal_run_request(
+                "true",
+                out_dir.path(),
+                "snap-done-task",
+            ))
+            .await
+            .expect("start short background task");
+        let done = session
+            .terminal_backend()
+            .wait_for_completion(&short.task_id, Some(Duration::from_secs(5)))
+            .await
+            .expect("short background task should complete");
+        assert!(done.completed, "short task must complete: {done:?}");
+        let listed = session.terminal_backend().list_tasks().await;
+        assert!(
+            listed
+                .iter()
+                .any(|t| t.task_id == short.task_id && t.completed && t.is_backgrounded),
+            "precondition: completed BG must still be in list_tasks: {listed:?}"
+        );
+        let snap = snapshot(&handler).await;
+        assert!(
+            snap.background_tasks
+                .iter()
+                .all(|t| t.task_id != short.task_id),
+            "completed BG must not appear: {:?}",
+            snap.background_tasks
+        );
+        assert_eq!(
+            snap.background_tasks.len(),
+            2,
+            "still-running BG tasks remain: {:?}",
+            snap.background_tasks
+        );
+        assert!(
+            snap.background_tasks
+                .iter()
+                .any(|t| t.task_id == bg.task_id),
+            "run_background task should still be present: {:?}",
+            snap.background_tasks
+        );
+        assert!(
+            snap.background_tasks
+                .iter()
+                .any(|t| t.task_id == "snap-fg-task"),
+            "transitioned FG should still be present: {:?}",
+            snap.background_tasks
+        );
+        session.terminal_backend().kill_task(&bg.task_id).await;
+        session.terminal_backend().kill_task("snap-fg-task").await;
+        let _ = fg_join.await;
     }
     /// Evicting one session while another is live must NOT global-drain (which
     /// would close the shared queue for the survivor) — even when the evicted
@@ -2215,7 +2354,7 @@ mod tests {
             .with_label_values(&[UNKNOWN_METHOD_LABEL, "error"])
             .get();
         let kind_before = WORKSPACE_RPC_ERRORS_TOTAL
-            .with_label_values(&[UNKNOWN_METHOD_LABEL, "hub_error"])
+            .with_label_values(&[UNKNOWN_METHOD_LABEL, "unknown_method"])
             .get();
         let mut stream = handler
             .handle_call(
@@ -2233,7 +2372,7 @@ mod tests {
         );
         assert!(
             WORKSPACE_RPC_ERRORS_TOTAL
-                .with_label_values(&[UNKNOWN_METHOD_LABEL, "hub_error"])
+                .with_label_values(&[UNKNOWN_METHOD_LABEL, "unknown_method"])
                 .get()
                 > kind_before,
             "a failed dispatch must also record its error_kind on the errors counter"
@@ -3044,6 +3183,7 @@ mod tests {
             <GitUnstageReq as WorkspaceRpc>::METHOD,
             <GitDiscardReq as WorkspaceRpc>::METHOD,
             <GitCommitReq as WorkspaceRpc>::METHOD,
+            <GitSyncBaseReq as WorkspaceRpc>::METHOD,
             <GitCheckoutReq as WorkspaceRpc>::METHOD,
             <GitStashReq as WorkspaceRpc>::METHOD,
             <GitInfoReq as WorkspaceRpc>::METHOD,
